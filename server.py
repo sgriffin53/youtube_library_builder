@@ -33,6 +33,8 @@ for line in lines:
 SS_USERNAME = config['soulseek_username']
 SS_PASSWORD = config['soulseek_password']
 SAVE_DIR = config['save_directory']
+CLICK_THRESHOLD = int(config['click_threshold'])
+DAY_THRESHOLD = int(config['day_threshold'])
 
 #f = open('soulseek_creds.txt', 'r', encoding='utf-8')
 #lines = f.readlines()
@@ -137,7 +139,7 @@ def record_click(url):
 def get_recent_click_count(url):
     conn = sqlite3.connect(CLICK_DB, timeout=30)
     cursor = conn.cursor()
-    cutoff = datetime.now() - timedelta(days=3)
+    cutoff = datetime.now() - timedelta(days=DAY_THRESHOLD)
     cursor.execute("SELECT COUNT(*) FROM clicks WHERE url = ? AND clicked_at > ?", (url, cutoff))
     count = cursor.fetchone()[0]
     conn.close()
@@ -179,6 +181,19 @@ def find_best_match(title, description):
 
         return s.strip()
 
+    def is_valid_guess(s, min_len=2):
+        """Reject empty strings, pure-symbol strings (e.g. '?????????'
+        from botched unicode normalisation), and guesses that are too
+        short to be meaningful (e.g. 'Go!')."""
+        if not s:
+            return False
+        if len(s) < min_len:
+            return False
+        # must contain at least 2 alphanumeric characters (unicode-aware)
+        if len(re.findall(r"\w", s, flags=re.UNICODE)) < 2:
+            return False
+        return True
+
     def similarity(a, b):
         return SequenceMatcher(None, a, b).ratio()
 
@@ -186,130 +201,217 @@ def find_best_match(title, description):
 
     title = title.replace(" - YouTube", "").strip()
 
-    artist_guess = None
-    song_guess = title
-
-    for sep in [" - ", " – ", " | ", ": "]:
-        if sep in title:
-            artist_guess, song_guess = title.split(sep, 1)
-            break
-
-    artist_guess = clean(artist_guess)
-    song_guess = clean(song_guess)
-
-    print("TITLE ARTIST:", artist_guess)
-    print("TITLE SONG:", song_guess)
-
     conn = sqlite3.connect(MUSIC_DB, timeout=30)
     cursor = conn.cursor()
 
-    candidates = []
+    def score_against_artist(real_artist, song_guess):
+        """Given a resolved DB artist and a candidate song title, fetch
+        that artist's songs and return (best_score, best_dict) or
+        (0, None) if nothing usable."""
 
-    # -----------------------------------
-    # Artist found in title
-    # -----------------------------------
+        if not is_valid_guess(song_guess):
+            return 0, None
 
-    if artist_guess:
+        cursor.execute(
+            "SELECT artist,title FROM songs WHERE lower(artist)=lower(?)",
+            (real_artist,)
+        )
+        rows = cursor.fetchall()
+
+        best_local = None
+        best_local_score = 0
+
+        for db_artist, db_song in rows:
+
+            if clean(db_artist) == song_guess:
+                continue
+
+            song_clean = clean(db_song)
+
+            score = 1.0 if song_clean == song_guess else similarity(song_clean, song_guess)
+
+            if score > best_local_score:
+                best_local_score = score
+                best_local = {"artist": db_artist, "song": db_song}
+
+        return best_local_score, best_local
+
+    def try_artist_guess(artist_guess, song_guess):
+        """Resolve artist_guess through ARTIST_INDEX and score it
+        against song_guess. Returns (score, result_dict, real_artist)
+        or (0, None, None) if the artist isn't recognised."""
+
+        artist_guess = clean(artist_guess) if artist_guess else ""
+
+        if not is_valid_guess(artist_guess):
+            return 0, None, None
 
         real_artist = ARTIST_INDEX.get(artist_guess)
 
+        if not real_artist:
+            return 0, None, None
+
+        score, result = score_against_artist(real_artist, clean(song_guess))
+        return score, result, real_artist
+
+    # A song-similarity score this high is treated as "good enough" -
+    # not worth burning more DB/regex work chasing a marginally
+    # better interpretation.
+    EARLY_EXIT_SCORE = 0.95
+
+    # Overall best across every interpretation we try below
+    overall_best = None
+    overall_best_score = 0
+    overall_best_artist = None  # real_artist string, used as fallback
+                                 # when we found the artist but not a
+                                 # confident song match
+    artist_resolved = False     # True once ANY stage successfully
+                                 # resolved a real artist via
+                                 # ARTIST_INDEX - gates the expensive
+                                 # last-resort full-index scan below
+
+    def consider(score, result, real_artist):
+        nonlocal overall_best, overall_best_score, overall_best_artist, artist_resolved
         if real_artist:
-            cursor.execute(
-                "SELECT artist,title FROM songs WHERE lower(artist)=lower(?)",
-                (real_artist,)
-            )
-            candidates = cursor.fetchall()
-            print("REAL ARTIST:", real_artist)
-            print("CANDIDATES:", len(candidates))
+            artist_resolved = True
+            if overall_best_artist is None:
+                overall_best_artist = real_artist
+        if score > overall_best_score:
+            overall_best_score = score
+            overall_best = result
+            if real_artist:
+                overall_best_artist = real_artist
 
-            #for c in candidates[:20]:
-            #    print(c)
+    # -----------------------------------------------------
+    # Fast path: YouTube's auto-generated Content ID
+    # description format for label uploads looks like:
+    #
+    #   Provided to YouTube by Universal Music Group
+    #   The Logical Song · Supertramp
+    #   Breakfast in America
+    #   ...
+    #
+    # The "Song · Artist" line is extremely reliable when
+    # present, and MUCH cheaper than the last-resort scan.
+    # Tried first since it's common and precise - avoids the
+    # "by Artist" stage misfiring on "by Universal Music
+    # Group" style label credits, and avoids the full
+    # ARTIST_INDEX scan entirely when it hits.
+    # -----------------------------------------------------
 
-    # -----------------------------------
-    # No artist in title - check "by Artist"
-    # -----------------------------------
+    if overall_best_score < EARLY_EXIT_SCORE:
 
-    if not candidates:
+        dot_match = re.search(r"([^\n·]+?)\s*·\s*([^\n·]+)", description)
+
+        if dot_match:
+            song_part = clean(dot_match.group(1))
+            artist_part = clean(dot_match.group(2))
+
+            score_e, result_e, artist_e = try_artist_guess(artist_part, song_part)
+            consider(score_e, result_e, artist_e)
+
+    # -----------------------------------------------------
+    # Title has a separator: try "Artist - Song" first (the
+    # common case). Only try the reversed "Song - Artist"
+    # ordering if the first interpretation wasn't already a
+    # confident match - most titles are the common order, so
+    # this avoids a second DB round-trip on the easy cases.
+    # -----------------------------------------------------
+
+    part1, part2 = None, None
+
+    for sep in [" - ", " – ", " | ", ": "]:
+        if sep in title:
+            part1, part2 = title.split(sep, 1)
+            break
+
+    if part1 is not None:
+
+        print("TITLE PART1:", clean(part1))
+        print("TITLE PART2:", clean(part2))
+
+        # Interpretation A: Artist - Song (the common case)
+        score_a, result_a, artist_a = try_artist_guess(part1, part2)
+        consider(score_a, result_a, artist_a)
+
+        # Interpretation B: Song - Artist (reversed) - skip if A
+        # already gave us a confident match
+        if overall_best_score < EARLY_EXIT_SCORE:
+            score_b, result_b, artist_b = try_artist_guess(part2, part1)
+            consider(score_b, result_b, artist_b)
+
+    # -----------------------------------------------------
+    # No confident match yet - look for the artist in the
+    # description instead, using the fullest reasonable
+    # song guess we have (whichever title part wasn't
+    # consumed as the artist, or the whole title if there
+    # was no separator at all).
+    # -----------------------------------------------------
+
+    if overall_best_score < EARLY_EXIT_SCORE:
+
+        fallback_song_guess = clean(title) if part1 is None else clean(part2)
 
         desc = clean(description)
 
-        match = re.search(r"\bby\s+([a-z0-9 '&.]+)", desc)
+        # "by Artist" phrasing in the description
+        match = re.search(r"\bby\s+([a-z0-9 '&.]+)", desc, flags=re.I)
 
         if match:
-
             possible_artist = clean(match.group(1))
-            real_artist = ARTIST_INDEX.get(possible_artist)
+            score_c, result_c, artist_c = try_artist_guess(possible_artist, fallback_song_guess)
+            consider(score_c, result_c, artist_c)
 
-            if real_artist:
-                cursor.execute(
-                    "SELECT artist,title FROM songs WHERE lower(artist)=lower(?)",
-                    (real_artist,)
-                )
-                candidates = cursor.fetchall()
+        # Last resort - scan known artists against the description.
+        # This is O(number of artists) regex matches, so it's gated
+        # behind artist_resolved: if we already found a real artist
+        # via the title or the "by Artist" phrase, there's no reason
+        # to pay for the full scan even if the song-title score was
+        # mediocre - we trust the resolved artist and accept a
+        # lower-confidence song match (returned as song=None below)
+        # rather than re-searching from scratch.
+        #
+        # Fixed: plain substring matching let short/generic artist
+        # names (e.g. "Go!") false-positive against almost any
+        # description. Now requires a word-boundary match, a minimum
+        # artist-name length, and only keeps the single longest
+        # (most specific) matching artist name.
+        if overall_best_score < EARLY_EXIT_SCORE and not artist_resolved:
 
+            desc_lower = desc.lower()
+            best_artist_match = None  # (real_artist, matched_len)
 
-    # -----------------------------------
-    # Last resort - scan known artists
-    # -----------------------------------
+            for artist_clean, real_artist in ARTIST_INDEX.items():
 
-    if not candidates:
+                if not is_valid_guess(artist_clean, min_len=3):
+                    continue
 
-        desc = clean(description)
+                pattern = r"\b" + re.escape(artist_clean.lower()) + r"\b"
 
-        for artist_clean, real_artist in ARTIST_INDEX.items():
+                if re.search(pattern, desc_lower):
+                    if best_artist_match is None or len(artist_clean) > best_artist_match[1]:
+                        best_artist_match = (real_artist, len(artist_clean))
 
-            if artist_clean in desc:
-
-                cursor.execute(
-                    "SELECT artist,title FROM songs WHERE artist=?",
-                    (real_artist,)
-                )
-
-                candidates.extend(cursor.fetchall())
-
-
-    if not candidates:
-        conn.close()
-        return None
-
-
-    best = None
-    best_score = 0
-
-
-    for db_artist, db_song in candidates:
-
-        if clean(db_artist) == song_guess:
-            continue
-
-        song_clean = clean(db_song)
-
-        if song_clean == song_guess:
-            score = 1.0
-        else:
-            score = similarity(song_clean, song_guess)
-
-        if score > best_score:
-            best_score = score
-            best = {
-                "artist": db_artist,
-                "song": db_song
-            }
-
+            if best_artist_match:
+                real_artist = best_artist_match[0]
+                score_d, result_d = score_against_artist(real_artist, fallback_song_guess)
+                consider(score_d, result_d, real_artist)
 
     conn.close()
 
-    print("BEST SCORE:", best_score)
+    print("BEST SCORE:", overall_best_score)
 
-    if best_score < 0.75:
-        return {
-            "artist": best["artist"],
-            "song": None
-        } if best else None
+    if overall_best_score < 0.75:
+        if overall_best_artist:
+            return {
+                "artist": overall_best_artist,
+                "song": None
+            }
+        return None
 
-    print("Matched:", best)
+    print("Matched:", overall_best)
 
-    return best
+    return overall_best
 import os
 import re
 from difflib import SequenceMatcher
@@ -520,7 +622,7 @@ def youtube():
     clicks = get_recent_click_count(url)
 
     print("Clicks last 3 days:", clicks)
-    if clicks < 3: return {}
+    if clicks < CLICK_THRESHOLD: return {}
     match = find_best_match(data.get("title", ""), data.get("description", ""))
 
     print("MATCH:", match)
