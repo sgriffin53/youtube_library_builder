@@ -37,6 +37,11 @@ venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+To install the extension:
+
+Go to about:debugging in Firefox and click 'Add Temporary Extension' and click the manifest.json file.
+The extension will now be loaded.
+
 To build the database:
 
 Run:
