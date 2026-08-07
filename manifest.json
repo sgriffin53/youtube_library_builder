@@ -1,0 +1,21 @@
+{
+  "manifest_version": 2,
+  "name": "YouTube Metadata",
+  "version": "1.0",
+
+  "permissions": [
+    "https://www.youtube.com/*",
+    "http://127.0.0.1:5001/*"
+  ],
+
+  "background": {
+    "scripts": ["background.js"]
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["https://www.youtube.com/*"],
+      "js": ["content.js"]
+    }
+  ]
+}

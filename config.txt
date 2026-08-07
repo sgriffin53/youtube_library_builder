@@ -1,0 +1,4 @@
+soulseek_username=set_username_here
+soulseek_password=set_password_here
+save_directory=set_directory_here
+server_ip=set_server_ip_here
