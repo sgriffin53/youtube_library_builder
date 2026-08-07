@@ -45,7 +45,11 @@ Run:
 
 This may take a long time (over an hour) and should produce an 11GB music.db file.
 
-Edit the config with your Soulseek username, preferred save directory, and server IP.
+Edit the config with your Soulseek username, preferred save directory, and server IP, click_threshold, and day_threshold.
+
+Click threshold and day threshold are how many times you have to click a video in how many days for it to download the song.
+
+For example, click_threshold=3 and day_threshold=5 will download any video's songs that you click 3 times within 5 days.
 
 If you're running the server on a VPS, set the server IP to your VPS's IP. If you're running the server locally, set it to 127.0.0.1.
 
