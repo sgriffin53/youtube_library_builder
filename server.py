@@ -429,71 +429,123 @@ def clean_filename(text):
 
 async def download_song(artist, title):
     async with download_lock:
+        import os
+        import glob
+        import traceback
+        import asyncio
+        from difflib import SequenceMatcher
+
+        async def abort_all_unfinished_transfers():
+            print("Cleaning up unfinished transfers...")
+            try:
+                transfer_manager = client.transfers
+            except Exception as e:
+                print("Couldn't access transfer manager:", e)
+                return
+
+            transfers = None
+            for attr in ("transfers", "_transfers", "active_transfers"):
+                try:
+                    value = getattr(transfer_manager, attr, None)
+                    if value is not None:
+                        transfers = list(value.values()) if isinstance(value, dict) else list(value)
+                        break
+                except Exception:
+                    pass
+
+            if transfers is None:
+                print("Couldn't enumerate transfers.")
+                return
+
+            unfinished = []
+            for transfer in transfers:
+                try:
+                    if transfer.is_finalized() or transfer.is_transfered():
+                        continue
+                    unfinished.append(transfer)
+                except Exception:
+                    unfinished.append(transfer)
+
+            print(f"Found {len(unfinished)} unfinished transfer(s).")
+
+            for transfer in unfinished:
+                try:
+                    filename = getattr(transfer, "remote_path", None) or getattr(transfer, "filename", None) or getattr(transfer, "local_path", None) or str(transfer)
+                    print("Aborting:", filename)
+                    await client.transfers.abort(transfer)
+                except Exception as e:
+                    print("Abort failed:", e)
+
+            await asyncio.sleep(1)
+
         if already_downloaded(artist, title):
             print("Already downloaded:", artist, "-", title)
             return None
-        import os
-        import traceback
-        from difflib import SequenceMatcher
+
+        await abort_all_unfinished_transfers()
+        print("=" * 60)
+        print("Starting download:", artist, "-", title)
+
+        await abort_all_unfinished_transfers()
 
         print("Searching...")
+        request = None
+        transfer = None
 
-        request = await client.searches.search(f"{artist} {title} mp3")
-        await asyncio.sleep(5)
+        try:
+            request = await client.searches.search(f"{artist} {title} mp3")
+            await asyncio.sleep(5)
 
-        wanted = clean_filename(f"{artist} - {title}")
-        candidates = []
-        print("results:", len(request.results))
-        for result in request.results:
-            for file in result.shared_items:
-                if not file.filename.lower().endswith(".mp3"):
+            wanted = clean_filename(f"{artist} - {title}")
+            candidates = []
+
+            print("results:", len(request.results))
+
+            for result in request.results:
+                for file in result.shared_items:
+                    if not file.filename.lower().endswith(".mp3"):
+                        continue
+                    if file.filesize > 15 * 1024 * 1024:
+                        continue
+
+                    filename = clean_filename(file.filename)
+                    score = SequenceMatcher(None, filename, wanted).ratio()
+                    score += min(file.filesize / 15000000, 0.20)
+                    score += min(result.avg_speed / 5000000, 0.30)
+
+                    if result.has_free_slots:
+                        score += 0.10
+
+                    if result.queue_size:
+                        score -= min(result.queue_size / 100, 0.20)
+
+                    candidates.append({
+                        "username": result.username,
+                        "filename": file.filename,
+                        "score": score,
+                        "filesize": file.filesize,
+                        "speed": result.avg_speed,
+                        "queue": result.queue_size
+                    })
+
+            candidates.sort(key=lambda x: x["score"], reverse=True)
+            print("candidates:", len(candidates))
+
+            for candidate in candidates[:10]:
+                print()
+                print("Trying:", candidate["username"])
+                print(candidate["filename"])
+                print("Score:", round(candidate["score"], 3))
+
+                if title.lower() not in candidate["filename"].lower():
+                    print("Skipping: title not found in filename")
                     continue
-                if file.filesize > 15 * 1024 * 1024:
-                    continue
-                filename = clean_filename(file.filename)
-                score = SequenceMatcher(None, filename, wanted).ratio()
 
-                # prefer larger files slightly (existing behaviour)
-                score += min(file.filesize / 15000000, 0.20)
+                await abort_all_unfinished_transfers()
+                transfer = None
 
-                # prefer users with faster upload speeds
-                score += min(result.avg_speed / 5000000, 0.30)
-
-                # prefer users with free slots
-                if result.has_free_slots:
-                    score += 0.10
-
-                # avoid huge queues
-                if result.queue_size:
-                    score -= min(result.queue_size / 100, 0.20)
-
-                candidates.append({
-                    "username": result.username,
-                    "filename": file.filename,
-                    "score": score,
-                    "filesize": file.filesize,
-                    "speed": result.avg_speed,
-                    "queue": result.queue_size
-                })
-        
-        candidates.sort(key=lambda x: x["score"], reverse=True)
-        print("candidates:", len(candidates))
-        for candidate in candidates[:5]:
-
-            print()
-            print("Trying:", candidate["username"])
-            print(candidate["filename"])
-            print("Score:", round(candidate["score"], 3))
-            if title.lower() not in candidate["filename"].lower(): continue
-            transfer = None
-
-            try:
                 try:
-                    transfer = await client.transfers.download(
-                        candidate["username"],
-                        candidate["filename"]
-                    )
-
+                    transfer = await client.transfers.download(candidate["username"], candidate["filename"])
                 except Exception as e:
                     print("Could not start transfer:", e)
                     continue
@@ -501,113 +553,192 @@ async def download_song(artist, title):
                 print("Initial:", type(transfer.state).__name__)
 
                 last_state = None
+                started = False
 
-                for _ in range(10):
-
-                    state = type(transfer.state).__name__
-
-                    if state != last_state:
-                        print(
-                            "State:",
-                            state,
-                            "queue:",
-                            transfer.place_in_queue,
-                            "remote:",
-                            transfer.remotely_queued,
-                            "bytes:",
-                            transfer.bytes_transfered,
-                            "fail:",
-                            transfer.fail_reason
-                        )
-                        last_state = state
-
-                    if transfer.is_transferring() or transfer.bytes_transfered > 0:
-                        print("Transfer started!")
+                for _ in range(30):
+                    try:
+                        state = type(transfer.state).__name__
+                        bytes_transferred = transfer.bytes_transfered
+                        fail_reason = transfer.fail_reason
+                        queue_position = transfer.place_in_queue
+                        remotely_queued = transfer.remotely_queued
+                    except Exception as e:
+                        print("Couldn't read transfer state:", e)
                         break
 
-                    if transfer.is_finalized() or transfer.fail_reason:
-                        print("Failed:", transfer.fail_reason)
+                    if state != last_state:
+                        print("State:", state, "queue:", queue_position, "remote:", remotely_queued, "bytes:", bytes_transferred, "fail:", fail_reason)
+                        last_state = state
+
+                    if transfer.is_transferring() or bytes_transferred > 0:
+                        print("Transfer started!")
+                        started = True
+                        break
+
+                    if transfer.is_finalized() or fail_reason:
+                        print("Transfer failed:", fail_reason)
                         break
 
                     await asyncio.sleep(1)
 
-                else:
-                    print("Peer never accepted transfer")
+                if not started:
+                    print("Peer never accepted transfer.")
                     try:
                         await client.transfers.abort(transfer)
-                    except:
-                        pass
+                    except Exception as e:
+                        print("Abort failed:", e)
+                    transfer = None
+                    await abort_all_unfinished_transfers()
                     continue
 
                 last_bytes = -1
                 idle = 0
+                download_failed = False
 
-                while not transfer.is_transfered():
+                while True:
+                    try:
+                        if transfer.is_transfered():
+                            break
 
-                    if transfer.is_finalized():
-                        print("Transfer failed:", transfer.fail_reason)
-                        break
+                        if transfer.is_finalized():
+                            print("Transfer failed:", transfer.fail_reason)
+                            download_failed = True
+                            break
 
-                    current = transfer.bytes_transfered
+                        current = transfer.bytes_transfered
+                        print("Downloading:", current, "/", transfer.filesize)
 
-                    print("Downloading:", current, "/", transfer.filesize)
+                        if current == last_bytes:
+                            idle += 1
+                        else:
+                            idle = 0
 
-                    if current == last_bytes:
-                        idle += 1
-                    else:
-                        idle = 0
+                        last_bytes = current
 
-                    last_bytes = current
+                        if idle > 120:
+                            print("Transfer stalled.")
+                            download_failed = True
+                            break
 
-                    if idle > 120:
-                        print("Transfer stalled")
+                    except Exception as e:
+                        print("Error monitoring transfer:", e)
+                        download_failed = True
                         break
 
                     await asyncio.sleep(1)
 
                 if transfer.is_transfered():
-
                     print("Download complete")
-
                     src = transfer.local_path
+
+                    if not src or not os.path.exists(src):
+                        print("Transfer says complete but local file doesn't exist:", src)
+                        try:
+                            await client.transfers.abort(transfer)
+                        except Exception:
+                            pass
+                        transfer = None
+                        await abort_all_unfinished_transfers()
+                        continue
 
                     dest_dir = os.path.join(SAVE_DIR, artist)
                     os.makedirs(dest_dir, exist_ok=True)
-
                     dest = os.path.join(dest_dir, f"{artist} - {title}.mp3")
 
-                    os.replace(src, dest)
+                    if os.path.exists(dest):
+                        try:
+                            os.remove(dest)
+                        except Exception as e:
+                            print("Couldn't remove existing file:", e)
 
+                    os.replace(src, dest)
                     print("Saved:", dest)
+
+                    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+                    for mp3 in glob.glob(os.path.join(script_dir, "*.mp3")):
+                        try:
+                            os.remove(mp3)
+                            print("Deleted stray file:", mp3)
+                        except Exception as e:
+                            print("Couldn't delete", mp3, ":", e)
+
                     try:
                         await client.transfers.abort(transfer)
-                    except:
-                        pass
+                    except Exception as e:
+                        print("Abort completed transfer failed:", e)
+
+                    transfer = None
+                    await asyncio.sleep(1)
+                    await abort_all_unfinished_transfers()
 
                     record_download(artist, title)
-                    try:
-                        await client.searches.cancel(request.ticket)
-                    except Exception:
-                        pass
+
+                    if request:
+                        try:
+                            await client.searches.cancel(request.ticket)
+                        except Exception:
+                            pass
+
+                    print("=" * 60)
                     return dest
 
+                if download_failed:
+                    print("Aborting failed/stalled transfer.")
+
+                    if transfer:
+                        try:
+                            await client.transfers.abort(transfer)
+                        except Exception as e:
+                            print("Abort failed:", e)
+
+                    transfer = None
+                    await asyncio.sleep(1)
+                    await abort_all_unfinished_transfers()
+                    continue
+
+            print("Couldn't download from any candidate.")
+            return None
+
+        except Exception:
+            traceback.print_exc()
+
+            if transfer:
+                try:
+                    await client.transfers.abort(transfer)
+                except Exception as e:
+                    print("Abort after exception failed:", e)
+
+            transfer = None
+            await asyncio.sleep(1)
+            await abort_all_unfinished_transfers()
+            return None
+
+        finally:
+            try:
+                if request:
+                    await client.searches.cancel(request.ticket)
             except Exception:
-                traceback.print_exc()
+                pass
 
-                if transfer:
-                    try:
-                        await client.transfers.abort(transfer)
-                        await asyncio.sleep(1)
-                    except Exception as e:
-                        print("Abort failed:", e)
+            await asyncio.sleep(0.5)
+            await abort_all_unfinished_transfers()
+            print("Download function cleanup complete.")
 
-        print("Couldn't download from any candidate.")
-        return None
+from pathlib import Path
+
+def remove_mp3s():
+    folder = Path("/home/jimmy/youtube_library")
+    for file in folder.glob("*.mp3"):
+        file.unlink()
+
 @app.route("/youtube", methods=["POST"])
 def youtube():
     print("POST RECEIVED")
     print("=" * 60)
     print("REQUEST RECEIVED")
+    print("Cleaning up MP3s")
+    remove_mp3s()
 
     data = request.get_json()
 
@@ -626,9 +757,14 @@ def youtube():
     match = find_best_match(data.get("title", ""), data.get("description", ""))
 
     print("MATCH:", match)
-    
-    match_artist = match['artist']
-    match_song = match['song']
+    if match['artist'] is not None:
+        match_artist = match['artist']
+    else:
+        match_artist = None
+    if match['song'] is not None:
+        match_song = match['song']
+    else:
+        match_song = None
     if match_song is not None: match_song = match_song.split("(")[0].split("[")[0]
     if match and match_artist and match_song:
         future = asyncio.run_coroutine_threadsafe(
